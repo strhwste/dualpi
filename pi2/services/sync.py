@@ -415,7 +415,6 @@ def main():
 
         except Exception as e:
             log.error("Sync error: %s", e)
-            release_session_lock()
 
         write_heartbeat()
         time.sleep(SYNC_INTERVAL)

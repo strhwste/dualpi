@@ -343,8 +343,20 @@ cp "$SCRIPT_DIR/smb.conf" /etc/samba/smb.conf
 if ! id timelapse-sync &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin timelapse-sync
 fi
+# Read Samba sync password from config.yaml if available, else use default
+SAMBA_SYNC_PASS="timelapse"
+if [[ -f /data/config.yaml ]] && command -v python3 &>/dev/null; then
+    SAMBA_SYNC_PASS=$(python3 -c "
+import yaml, sys
+try:
+    c = yaml.safe_load(open('/data/config.yaml'))
+    print(c.get('samba', {}).get('sync_password', 'timelapse'))
+except Exception:
+    print('timelapse')
+" 2>/dev/null || echo "timelapse")
+fi
 # Set Samba password for timelapse-sync (non-interactive)
-printf 'timelapse\ntimelapse\n' | smbpasswd -s -a timelapse-sync
+printf '%s\n%s\n' "$SAMBA_SYNC_PASS" "$SAMBA_SYNC_PASS" | smbpasswd -s -a timelapse-sync
 smbpasswd -e timelapse-sync
 
 systemctl enable smbd nmbd

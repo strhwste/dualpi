@@ -15,12 +15,14 @@ A production-ready, self-healing timelapse capture and display system designed f
 ┌─────────────────────────────┐         WiFi AP (WPA2)        ┌──────────────────────────────┐
 │  Pi 1 — Camera Pi           │◄─────────────────────────────►│  Pi 2 — Display Pi           │
 │  192.168.50.1               │   SSID: timelapse-ap          │  192.168.50.20               │
+│  pi1-camera.local (mDNS)    │                                │  pi2-display.local (mDNS)    │
 │                             │                                │                              │
 │  • rpicam capture           │   Samba share ───────────────►│  • Image sync (rsync)        │
-│  • Flask admin portal :80   │                                │  • mpv playback              │
-│  • Samba shares             │   NTP time sync ─────────────►│  • Flask status API :5000    │
-│  • Chrony NTP server        │                                │  • ffmpeg rendering          │
-│  • USB Working + Backup     │   HTTP status polling ◄───────│                              │
+│  • Flask admin portal :80   │   (timelapse-sync user)        │  • mpv playback              │
+│  • Samba shares (SMB3)      │                                │  • Flask status API :5000    │
+│  • Chrony NTP server        │   NTP time sync ─────────────►│  • ffmpeg rendering          │
+│  • USB Working + Backup     │   HTTP status polling ◄───────│  • systemd .mount/.automount │
+│  • Avahi mDNS               │                                │  • Avahi mDNS                │
 └─────────────────────────────┘                                └──────────────────────────────┘
 ```
 
@@ -122,13 +124,13 @@ This makes Pi 1 bring up the AP, NTP server, Samba share, capture loop, and admi
 
 ```bash
 ssh pi@192.168.50.20
-sudo systemctl enable wifi-retry.service chrony sync.service playback.service status_api.service
+sudo systemctl enable wifi-retry.service chrony mnt-timelapse.automount sync.service playback.service status_api.service
 sudo systemctl start wifi-retry.service
 sudo systemctl restart chrony
-sudo systemctl start sync.service playback.service status_api.service
+sudo systemctl start mnt-timelapse.automount sync.service playback.service status_api.service
 ```
 
-This makes Pi 2 reconnect to Pi 1 automatically, resync images, relaunch playback, and restore the status API on every boot.
+This makes Pi 2 reconnect to Pi 1 automatically, mount the Samba share on demand via systemd automount, resync images, relaunch playback, and restore the status API on every boot.
 
 ### Updating the Software
 
@@ -159,8 +161,8 @@ sudo bash pi2/update.sh
 
 The update scripts:
 1. Fix `.git` directory ownership (resolves "Permission denied" errors from running `setup.sh` as root)
-2. Run `git pull --ff-only` to fetch the latest changes
-3. Copy updated Python scripts, shell scripts, and systemd units to their system locations
+2. Run `git fetch` + `git reset --hard` for atomic updates (no merge conflicts)
+3. Copy updated Python scripts, shell scripts, systemd units, and mount units to their system locations
 4. Reload systemd and restart all affected services
 
 > **Note:** Pi 1 needs internet access to reach the git remote. Either connect via Ethernet or switch Pi 1 to Wi-Fi client mode using the `uplink_wifi_ssid` setting in the admin portal before running the update.
@@ -509,17 +511,21 @@ sudo systemctl status samba smbd nmbd
 # The service that matters on Pi 2 is the sync loop
 sudo systemctl status sync.service
 
+# Check the declarative systemd mount unit
+sudo systemctl status mnt-timelapse.mount
+sudo systemctl status mnt-timelapse.automount
+
 # Check WiFi link to Pi 1
 sudo systemctl status wifi-retry.service
 
 # Test connectivity
 ping -c 3 192.168.50.1
 
-# List available shares (guest, no password)
-smbclient -N -L //192.168.50.1
+# List available shares (authenticated)
+smbclient -U timelapse-sync%timelapse -L //192.168.50.1
 
 # Try manual mount (uses credential file)
-sudo mount -t cifs //192.168.50.1/timelapse /mnt/timelapse -o credentials=/etc/samba/pi1_credentials,vers=3.0
+sudo mount -t cifs //192.168.50.1/timelapse /mnt/timelapse -o credentials=/etc/samba/pi1_credentials,vers=3.1.1
 
 # Check mount
 df -h /mnt/timelapse
@@ -532,7 +538,10 @@ ls /data/cache/
 # Watch the automatic sync loop
 journalctl -u sync.service --no-pager -n 50
 
-# Verify Pi 1's Samba config allows guest access
+# Check Pi 2 health (includes WiFi RSSI, Pi1 ping, mount status)
+curl http://localhost:5000/health
+
+# Verify Pi 1's Samba config
 # On Pi 1: testparm -s /etc/samba/smb.conf
 ```
 
@@ -546,19 +555,15 @@ If the timelapse share appears in Finder's **Network** sidebar but you get
 "connection failed" or a blank window when opening it:
 
 ```bash
-# 1. Connect explicitly as Guest from Terminal
-open smb://guest@192.168.50.1/timelapse
-
-# 2. If the above still fails, allow insecure guest auth (run once, reboot)
-sudo defaults write /Library/Preferences/com.apple.NetAuthAgent AllowUnconfirmedSMBGuest -bool true
-
-# 3. After reboot, retry:
-open smb://guest@192.168.50.1/timelapse
+# Connect as the timelapse-sync user from Terminal
+open smb://timelapse-sync@192.168.50.1/timelapse
+# Password: timelapse
 ```
 
-macOS Ventura (13+) blocks unauthenticated guest SMB connections by default.
-The `AllowUnconfirmedSMBGuest` preference re-enables them. This is safe on the
-air-gapped `timelapse-ap` network.
+With the dedicated `timelapse-sync` Samba user and SMB3 + fruit VFS module,
+macOS Finder should connect without needing guest authentication workarounds.
+The `fruit:aapl = yes` and `fruit:metadata = netatalk` settings provide
+native macOS compatibility.
 
 ---
 
@@ -570,27 +575,33 @@ pi1/
   update.sh             ← Pull & re-deploy Pi 1 services (run as root)
   hostapd.conf          ← WiFi AP config
   dnsmasq.conf          ← DHCP/DNS config
-  smb.conf              ← Samba shares config (guest auth, no passwords)
+  smb.conf              ← Samba shares config (timelapse-sync user, SMB3)
   chrony.conf           ← NTP server config
+  config.yaml           ← Default configuration (single source-of-truth)
   fstab_entries.txt     ← Reference fstab lines for USB sticks
+  Containerfile.portal  ← Podman/Docker container for admin portal
   services/
     capture.py          ← Photo capture service
     capture.service     ← systemd unit
     portal.py           ← Flask admin dashboard (templates inline)
     portal.service      ← systemd unit
+    config_loader.py    ← YAML config → JSON/conf file templating
     backup.sh           ← Daily backup cron script
     disk_monitor.sh     ← Disk usage monitor cron script
 
 pi2/
   setup.sh              ← Full Pi 2 setup (run as root; USB format + Waveshare display config)
   update.sh             ← Pull & re-deploy Pi 2 services (run as root)
-  fstab_entries.txt     ← Reference fstab lines (USB, Samba, tmpfs)
+  fstab_entries.txt     ← Reference fstab lines (USB, tmpfs)
+  Containerfile.status-api ← Podman/Docker container for status API
   services/
-    sync.py             ← Image sync service (with Samba connectivity checks)
-    sync.service        ← systemd unit
+    sync.py             ← Image sync service (with session lock + systemd mount integration)
+    sync.service        ← systemd unit (depends on mnt-timelapse.automount)
     playback.py         ← mpv playback controller (DRM auto-detect, boot wait)
     playback.service    ← systemd unit (DRM/video group access)
     render.sh           ← Archival render cron script
-    status_api.py       ← Flask status API
+    status_api.py       ← Flask status API (WiFi RSSI, ping, mount health)
     status_api.service  ← systemd unit
+    mnt-timelapse.mount     ← Declarative CIFS mount unit
+    mnt-timelapse.automount ← Lazy on-demand automount unit
 ```

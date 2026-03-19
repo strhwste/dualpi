@@ -10,6 +10,7 @@ No authentication (isolated local network).
 import json
 import glob
 import os
+import re
 import subprocess
 import time
 import threading
@@ -167,7 +168,6 @@ def get_wifi_rssi() -> str:
                 if part.startswith("level="):
                     return part.split("=", 1)[1]
             # Alternative format: "Signal level=-XX dBm"
-            import re
             m = re.search(r"Signal level[=:]?\s*(-?\d+)", result.stdout)
             if m:
                 return m.group(1) + " dBm"
@@ -184,7 +184,6 @@ def ping_pi1() -> dict:
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
-            import re
             m = re.search(r"time=(\d+\.?\d*)", result.stdout)
             latency = m.group(1) + " ms" if m else "ok"
             return {"reachable": True, "latency": latency}

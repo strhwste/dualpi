@@ -336,9 +336,21 @@ info "Pi 2 is a Samba/CIFS client only — no local samba.service is expected he
 
 # Create credentials file for authenticated mount
 mkdir -p /etc/samba
-cat > /etc/samba/pi1_credentials <<'EOF'
+# Read Samba sync password from config.yaml if available, else use default
+SAMBA_SYNC_PASS="timelapse"
+if [[ -f /data/config.yaml ]] && command -v python3 &>/dev/null; then
+    SAMBA_SYNC_PASS=$(python3 -c "
+import yaml, sys
+try:
+    c = yaml.safe_load(open('/data/config.yaml'))
+    print(c.get('samba', {}).get('sync_password', 'timelapse'))
+except Exception:
+    print('timelapse')
+" 2>/dev/null || echo "timelapse")
+fi
+cat > /etc/samba/pi1_credentials <<EOF
 username=timelapse-sync
-password=timelapse
+password=${SAMBA_SYNC_PASS}
 EOF
 chmod 600 /etc/samba/pi1_credentials
 
@@ -353,7 +365,7 @@ systemctl enable mnt-timelapse.automount
 
 # Verify Samba connectivity to Pi 1 (non-blocking — Pi 1 may not be up yet)
 info "Testing Samba connectivity to Pi 1…"
-if smbclient -U timelapse-sync%timelapse -L //192.168.50.1 2>/dev/null | grep -qi timelapse; then
+if smbclient -U "timelapse-sync%${SAMBA_SYNC_PASS}" -L //192.168.50.1 2>/dev/null | grep -qi timelapse; then
     info "✓ Samba share 'timelapse' found on Pi 1"
 else
     warn "Could not reach Pi 1 Samba share — Pi 1 may not be running yet."

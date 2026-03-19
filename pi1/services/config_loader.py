@@ -37,6 +37,7 @@ DEFAULTS = {
     "uplink_wifi": {"ssid": "", "password": ""},
     "admin": {"password": "changeme"},
     "rendering": {"ffmpeg_video_backup_enabled": True},
+    "samba": {"sync_password": "timelapse"},
 }
 
 
@@ -85,13 +86,22 @@ def template_hostapd(cfg: dict, path: str = "/etc/hostapd/hostapd.conf"):
     """Update hostapd.conf SSID and password from config."""
     if not os.path.isfile(path):
         return
+
+    import re as re_mod
+
+    ssid = cfg['wifi']['ssid']
+    password = cfg['wifi']['password']
+
+    # Validate: hostapd requires 8-63 character passphrase for WPA-PSK
+    if len(password) < 8 or len(password) > 63:
+        print(f"Warning: WiFi password must be 8-63 characters (got {len(password)})")
+
     with open(path) as f:
         content = f.read()
-    import re
-    content = re.sub(r"^ssid=.*$", f"ssid={cfg['wifi']['ssid']}", content, flags=re.MULTILINE)
-    content = re.sub(r"^wpa_passphrase=.*$", f"wpa_passphrase={cfg['wifi']['password']}", content, flags=re.MULTILINE)
+    content = re_mod.sub(r"^ssid=.*$", f"ssid={ssid}", content, flags=re_mod.MULTILINE)
+    content = re_mod.sub(r"^wpa_passphrase=.*$", f"wpa_passphrase={password}", content, flags=re_mod.MULTILINE)
     if cfg["wifi"].get("channel"):
-        content = re.sub(r"^channel=.*$", f"channel={cfg['wifi']['channel']}", content, flags=re.MULTILINE)
+        content = re_mod.sub(r"^channel=.*$", f"channel={cfg['wifi']['channel']}", content, flags=re_mod.MULTILINE)
     with open(path, "w") as f:
         f.write(content)
 

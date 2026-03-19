@@ -37,3 +37,7 @@ admin:
 # ── Video Rendering ──────────────────────────────────────────────────────────
 rendering:
   ffmpeg_video_backup_enabled: true
+
+# ── Samba Share Authentication ───────────────────────────────────────────────
+samba:
+  sync_password: timelapse   # password for timelapse-sync user (Pi2 → Pi1)
