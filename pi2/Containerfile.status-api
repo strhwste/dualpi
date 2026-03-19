@@ -1,0 +1,19 @@
+# Containerfile for Pi 2 Status API (Flask)
+# Build:  podman build -t timelapse-status-api -f Containerfile.status-api .
+# Run:    podman run -d --name status-api -p 5000:5000 -v /data:/data:rw timelapse-status-api
+FROM docker.io/library/python:3.11-slim
+
+RUN pip install --no-cache-dir flask pyyaml
+
+COPY services/status_api.py /opt/status_api.py
+
+WORKDIR /data
+EXPOSE 5000
+
+ENV PYTHONUNBUFFERED=1
+ENV FLASK_RUN_HOST=::
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+
+CMD ["python3", "/opt/status_api.py"]

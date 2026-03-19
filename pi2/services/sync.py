@@ -21,11 +21,33 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [sync] %(levelname)s %(message)s",
-    stream=sys.stdout,
-)
+
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for journal integration."""
+
+    def format(self, record):
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "service": "sync",
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+
+# Use JSON logging if LOG_FORMAT=json, otherwise use human-readable format
+if os.environ.get("LOG_FORMAT") == "json":
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [sync] %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
 log = logging.getLogger("sync")
 
 REMOTE_DIR = "/mnt/timelapse/current"
@@ -37,6 +59,7 @@ LOCAL_SESSION = os.path.join(LOCAL_CACHE, "session.id")
 REMOTE_SESSION = os.path.join(REMOTE_DIR, "session.id")
 LAST_SYNC_FILE = "/data/last_sync.txt"
 HEARTBEAT_FILE = "/data/sync_heartbeat.txt"
+SESSION_LOCK = "/data/cache/session.lock"
 SYNC_INTERVAL = 60  # seconds
 MOUNT_CHECK_TIMEOUT = 10  # seconds — max time to wait for a mount probe
 
@@ -52,6 +75,32 @@ def write_heartbeat():
     """Write current timestamp to heartbeat file so monitors can detect hangs."""
     try:
         atomic_write(HEARTBEAT_FILE, datetime.now().isoformat())
+    except Exception:
+        pass
+
+
+def acquire_session_lock() -> bool:
+    """Acquire session lock to prevent partial syncs on crash."""
+    try:
+        if os.path.isfile(SESSION_LOCK):
+            # Check if lock is stale (older than 10 minutes)
+            age = time.time() - os.path.getmtime(SESSION_LOCK)
+            if age < 600:
+                log.warning("Session lock exists (age %.0fs) — another sync may be running", age)
+                return False
+            log.warning("Removing stale session lock (age %.0fs)", age)
+        atomic_write(SESSION_LOCK, f"{os.getpid()}:{datetime.now().isoformat()}")
+        return True
+    except Exception as e:
+        log.warning("Failed to acquire session lock: %s", e)
+        return True  # proceed anyway if lock mechanism fails
+
+
+def release_session_lock():
+    """Release session lock after sync completes."""
+    try:
+        if os.path.isfile(SESSION_LOCK):
+            os.remove(SESSION_LOCK)
     except Exception:
         pass
 
@@ -131,13 +180,18 @@ def recover_stale_mount():
 
 
 def remote_available() -> bool:
-    """Ensure the Samba mount is available, even after cold boots/outages.
+    """Ensure the Samba mount is available via systemd automount.
 
     Returns True when the mount point is accessible, regardless of whether
     session.id exists.  This lets the sync loop proceed and pull whatever
     frames are available (archive and/or current).
+
+    With declarative systemd .mount/.automount units, accessing the mount
+    point triggers the automount.  This function checks accessibility and
+    falls back to explicit systemctl commands for recovery.
     """
     # Quick check: can we read the mount point directory?
+    # With automount, this access triggers the mount automatically.
     if _safe_isdir(REMOTE_MOUNT):
         return True
 
@@ -161,20 +215,21 @@ def remote_available() -> bool:
         recover_stale_mount()
         return _safe_isdir(REMOTE_MOUNT)
 
-    # Try mounting (handles automount and fstab-based mounts)
+    # Try restarting the systemd mount unit (preferred over raw mount command)
     try:
         result = subprocess.run(
-            ["mount", REMOTE_MOUNT],
+            ["systemctl", "restart", "mnt-timelapse.mount"],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if result.returncode == 0:
-            log.info("Mounted Pi 1 timelapse share at %s", REMOTE_MOUNT)
+            log.info("Restarted mnt-timelapse.mount — share at %s", REMOTE_MOUNT)
         elif result.stderr.strip():
-            log.warning("Mount retry returned %d: %s", result.returncode, result.stderr.strip())
+            log.warning("systemctl restart mnt-timelapse.mount returned %d: %s",
+                        result.returncode, result.stderr.strip())
     except Exception as e:
-        log.warning("Mount retry failed: %s", e)
+        log.warning("systemctl restart mnt-timelapse.mount failed: %s", e)
 
     if _safe_isdir(REMOTE_MOUNT):
         return True
@@ -182,7 +237,8 @@ def remote_available() -> bool:
     # Fall back: verify Pi 1 is reachable and Samba share exists
     try:
         result = subprocess.run(
-            ["smbclient", "-N", "-L", "//192.168.50.1", "--timeout=5"],
+            ["smbclient", "-U", "timelapse-sync%timelapse",
+             "-L", "//192.168.50.1", "--timeout=5"],
             capture_output=True,
             text=True,
             timeout=15,
@@ -312,6 +368,8 @@ def main():
     log.info("Sync service starting…")
     os.makedirs(LOCAL_CACHE, exist_ok=True)
     os.makedirs(LOCAL_ARCHIVE, exist_ok=True)
+    # Clean up stale session lock from previous crash
+    release_session_lock()
     write_heartbeat()
 
     while True:
@@ -323,32 +381,41 @@ def main():
                 time.sleep(SYNC_INTERVAL)
                 continue
 
-            # ── Sync archived sessions ──────────────────────────────────
-            write_heartbeat()
-            archive_count = sync_archive_sessions()
-            if archive_count > 0:
-                log.info("Archive sync: %d frames across archive sessions", archive_count)
+            if not acquire_session_lock():
+                log.warning("Could not acquire session lock — skipping this cycle")
+                time.sleep(SYNC_INTERVAL)
+                continue
 
-            # ── Handle current session ──────────────────────────────────
-            remote_sid = get_remote_session()
-            local_sid = get_local_session()
+            try:
+                # ── Sync archived sessions ──────────────────────────────────
+                write_heartbeat()
+                archive_count = sync_archive_sessions()
+                if archive_count > 0:
+                    log.info("Archive sync: %d frames across archive sessions", archive_count)
 
-            if remote_sid and remote_sid != local_sid:
-                log.info("Session changed: '%s' → '%s' — wiping current cache", local_sid, remote_sid)
-                wipe_cache()
-                atomic_write(LOCAL_SESSION, remote_sid)
+                # ── Handle current session ──────────────────────────────────
+                remote_sid = get_remote_session()
+                local_sid = get_local_session()
 
-            log.info("Syncing frames…")
-            write_heartbeat()
-            if sync_frames():
-                atomic_write(LAST_SYNC_FILE, datetime.now().isoformat())
-                total = count_all_frames()
-                log.info("Sync complete — %d total frames in cache", total)
-            else:
-                log.warning("Sync had issues — will retry next cycle")
+                if remote_sid and remote_sid != local_sid:
+                    log.info("Session changed: '%s' → '%s' — wiping current cache", local_sid, remote_sid)
+                    wipe_cache()
+                    atomic_write(LOCAL_SESSION, remote_sid)
+
+                log.info("Syncing frames…")
+                write_heartbeat()
+                if sync_frames():
+                    atomic_write(LAST_SYNC_FILE, datetime.now().isoformat())
+                    total = count_all_frames()
+                    log.info("Sync complete — %d total frames in cache", total)
+                else:
+                    log.warning("Sync had issues — will retry next cycle")
+            finally:
+                release_session_lock()
 
         except Exception as e:
             log.error("Sync error: %s", e)
+            release_session_lock()
 
         write_heartbeat()
         time.sleep(SYNC_INTERVAL)

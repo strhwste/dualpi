@@ -1,0 +1,23 @@
+# Containerfile for Pi 1 Admin Portal (Flask)
+# Build:  podman build -t timelapse-portal -f Containerfile.portal .
+# Run:    podman run -d --name portal -p 80:80 -v /data:/data:rw timelapse-portal
+FROM docker.io/library/python:3.11-slim
+
+RUN pip install --no-cache-dir flask pillow pyyaml
+
+COPY services/portal.py /opt/portal.py
+COPY services/config_loader.py /opt/config_loader.py
+COPY config.yaml /opt/config.yaml
+
+# Copy templates if present
+COPY services/templates/ /opt/templates/
+
+WORKDIR /data
+EXPOSE 80
+
+ENV PYTHONUNBUFFERED=1
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:80/health')" || exit 1
+
+CMD ["python3", "/opt/portal.py"]

@@ -51,7 +51,13 @@ git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR"
 
 cd "$REPO_DIR"
 BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-git pull --ff-only || error "git pull failed. Resolve any conflicts manually."
+
+# Atomic update: fetch then reset to remote, preserving any local stashes
+git fetch origin || error "git fetch failed. Check network connectivity."
+git stash --include-untracked 2>/dev/null || true
+git reset --hard origin/main || git reset --hard origin/HEAD || error "git reset failed."
+git stash drop 2>/dev/null || true
+
 AFTER=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
 if [[ "$BEFORE" == "$AFTER" ]]; then
@@ -69,9 +75,10 @@ chown -R "${REPO_OWNER_UID}:${REPO_OWNER_GID}" "$REPO_DIR/.git"
 ###############################################################################
 info "Re-deploying Pi 1 services…"
 
-cp "$SCRIPT_DIR/services/capture.py"      /opt/capture.py
-cp "$SCRIPT_DIR/services/portal.py"       /opt/portal.py
-chmod +x /opt/capture.py /opt/portal.py
+cp "$SCRIPT_DIR/services/capture.py"       /opt/capture.py
+cp "$SCRIPT_DIR/services/portal.py"        /opt/portal.py
+cp "$SCRIPT_DIR/services/config_loader.py" /opt/config_loader.py
+chmod +x /opt/capture.py /opt/portal.py /opt/config_loader.py
 
 # Templates
 mkdir -p /opt/templates

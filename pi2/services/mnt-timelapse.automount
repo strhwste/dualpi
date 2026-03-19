@@ -1,0 +1,11 @@
+[Unit]
+Description=Automount Pi1 timelapse share on first access
+After=network-online.target wifi-retry.service
+Wants=network-online.target wifi-retry.service
+
+[Automount]
+Where=/mnt/timelapse
+TimeoutIdleSec=300
+
+[Install]
+WantedBy=multi-user.target

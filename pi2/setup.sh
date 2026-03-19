@@ -38,8 +38,8 @@ info "Current time: $(date)"
 info "Updating apt and installing packages…"
 apt-get update -qq
 apt-get install -y \
-  cifs-utils samba-client rsync ffmpeg mpv \
-  python3-flask python3-pip \
+  cifs-utils smbclient rsync ffmpeg mpv \
+  python3-flask python3-pip python3-yaml \
   chrony fake-hwclock jq exfatprogs \
   avahi-daemon
 
@@ -91,17 +91,21 @@ if command -v nmcli &>/dev/null; then
         connection.autoconnect yes connection.autoconnect-retries 0 2>/dev/null || true
 fi
 
-# Create connection retry service with exponential backoff
+# Create connection retry service using systemd restart with exponential backoff
 cat > /etc/systemd/system/wifi-retry.service <<'EOF'
 [Unit]
 Description=WiFi connection retry with exponential backoff
 After=network-pre.target
 Wants=network-pre.target
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
 [Service]
 Type=oneshot
 ExecStart=/opt/wifi_retry.sh
-RemainAfterExit=no
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -109,22 +113,30 @@ EOF
 
 cat > /opt/wifi_retry.sh <<'SCRIPT'
 #!/usr/bin/env bash
-# Retry WiFi connection with exponential backoff
+# Check WiFi connection and reconnect if needed.
+# Called by systemd with Restart=on-failure for exponential backoff.
+set -euo pipefail
+
+MAX_ATTEMPTS=10
 DELAY=2
-MAX_DELAY=120
-while true; do
-    if ip addr show wlan0 | grep -q "192.168.50.20"; then
-        logger -t wifi-retry "Connected to AP"
+
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    if ip addr show wlan0 2>/dev/null | grep -q "192.168.50.20"; then
+        logger -t wifi-retry "Connected to AP (attempt $attempt)"
         exit 0
     fi
-    logger -t wifi-retry "AP not available — retrying in ${DELAY}s"
+    logger -t wifi-retry "AP not available — attempt $attempt/$MAX_ATTEMPTS, retrying in ${DELAY}s"
     sleep "$DELAY"
     DELAY=$(( DELAY * 2 ))
-    [[ $DELAY -gt $MAX_DELAY ]] && DELAY=$MAX_DELAY
+    [[ $DELAY -gt 60 ]] && DELAY=60
     # Trigger re-connection attempt
     wpa_cli -i wlan0 reconnect 2>/dev/null || true
     nmcli con up timelapse-client 2>/dev/null || true
 done
+
+# If we get here, all attempts failed — exit non-zero to trigger systemd restart
+logger -t wifi-retry "All $MAX_ATTEMPTS attempts failed — systemd will retry"
+exit 1
 SCRIPT
 chmod +x /opt/wifi_retry.sh
 systemctl enable wifi-retry.service
@@ -317,36 +329,40 @@ info "Creating local data directories…"
 mkdir -p /data/cache /data/renders /mnt/timelapse
 
 ###############################################################################
-# 5. Mount Pi 1's Samba share
+# 5. Mount Pi 1's Samba share via declarative systemd .mount/.automount
 ###############################################################################
-info "Configuring Samba mount…"
+info "Configuring Samba mount (systemd .mount + .automount units)…"
 info "Pi 2 is a Samba/CIFS client only — no local samba.service is expected here."
 
-# Create credentials file for Samba guest mount (avoids fstab inline creds)
+# Create credentials file for authenticated mount
+mkdir -p /etc/samba
 cat > /etc/samba/pi1_credentials <<'EOF'
-username=guest
-password=
+username=timelapse-sync
+password=timelapse
 EOF
 chmod 600 /etc/samba/pi1_credentials
 
-# Append fstab entry
-if ! grep -q "192.168.50.1/timelapse" /etc/fstab; then
-    cat >> /etc/fstab <<'EOF'
-//192.168.50.1/timelapse  /mnt/timelapse  cifs  credentials=/etc/samba/pi1_credentials,_netdev,nofail,x-systemd.automount,uid=1000,gid=1000,iocharset=utf8,vers=3.0  0  0
-EOF
-fi
+# Remove legacy fstab CIFS entry (replaced by systemd .mount unit)
+sed -i '\|192.168.50.1/timelapse|d' /etc/fstab
+
+# Install declarative systemd mount and automount units
+cp "$SCRIPT_DIR/services/mnt-timelapse.mount"     /etc/systemd/system/
+cp "$SCRIPT_DIR/services/mnt-timelapse.automount"  /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable mnt-timelapse.automount
 
 # Verify Samba connectivity to Pi 1 (non-blocking — Pi 1 may not be up yet)
 info "Testing Samba connectivity to Pi 1…"
-if smbclient -N -L //192.168.50.1 2>/dev/null | grep -qi timelapse; then
+if smbclient -U timelapse-sync%timelapse -L //192.168.50.1 2>/dev/null | grep -qi timelapse; then
     info "✓ Samba share 'timelapse' found on Pi 1"
 else
     warn "Could not reach Pi 1 Samba share — Pi 1 may not be running yet."
-    warn "The share will be mounted automatically at boot via systemd automount."
+    warn "The share will mount on-demand via mnt-timelapse.automount."
 fi
 
-# Create credentials-free mount  
-mount -a 2>/dev/null || warn "Could not mount Samba share — Pi 1 may not be running yet."
+# Try starting automount (non-blocking)
+systemctl start mnt-timelapse.automount 2>/dev/null || \
+    warn "Automount not started — Pi 1 may not be running yet."
 
 ###############################################################################
 # 6. Install Python services
@@ -363,12 +379,14 @@ chmod +x /opt/sync.py /opt/playback.py /opt/status_api.py
 ###############################################################################
 info "Installing systemd service units…"
 
-cp "$SCRIPT_DIR/services/sync.service"       /etc/systemd/system/
-cp "$SCRIPT_DIR/services/playback.service"   /etc/systemd/system/
-cp "$SCRIPT_DIR/services/status_api.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/services/sync.service"             /etc/systemd/system/
+cp "$SCRIPT_DIR/services/playback.service"         /etc/systemd/system/
+cp "$SCRIPT_DIR/services/status_api.service"       /etc/systemd/system/
+cp "$SCRIPT_DIR/services/mnt-timelapse.mount"      /etc/systemd/system/
+cp "$SCRIPT_DIR/services/mnt-timelapse.automount"  /etc/systemd/system/
 
 systemctl daemon-reload
-systemctl enable sync.service playback.service status_api.service
+systemctl enable sync.service playback.service status_api.service mnt-timelapse.automount
 
 ###############################################################################
 # 8. Cron jobs
@@ -439,13 +457,14 @@ Storage=volatile
 RuntimeMaxUse=50M
 EOF
 
-# tmpfs for /var/log and /tmp to reduce SD writes
+# tmpfs for /var/log, /tmp, and /tmp/sync to reduce SD writes
 if ! grep -q "tmpfs.*/var/log" /etc/fstab; then
     cat >> /etc/fstab <<'EOF'
 tmpfs  /var/log  tmpfs  defaults,noatime,nosuid,nodev,size=50M  0  0
 tmpfs  /tmp      tmpfs  defaults,noatime,nosuid,nodev,size=100M 0  0
 EOF
 fi
+mkdir -p /tmp/sync
 
 systemctl restart systemd-journald 2>/dev/null || true
 
