@@ -38,7 +38,7 @@ info "Current time: $(date)"
 info "Updating apt and installing packages…"
 apt-get update -qq
 apt-get install -y \
-  cifs-utils samba-client rsync ffmpeg mpv \
+  cifs-utils smbclient rsync ffmpeg mpv \
   python3-flask python3-pip \
   chrony fake-hwclock jq exfatprogs \
   avahi-daemon

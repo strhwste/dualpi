@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/mkdir -p /data/cache /data/renders
 ExecStart=/usr/bin/python3 /opt/sync.py
 WorkingDirectory=/data
 Restart=always
