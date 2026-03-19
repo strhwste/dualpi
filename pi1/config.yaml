@@ -1,0 +1,43 @@
+# /data/config.yaml — Single source-of-truth configuration
+# Timelapse Art Installation
+#
+# This file is the primary configuration for both Pi 1 and Pi 2.
+# Changes here can be applied by running: python3 /opt/config_loader.py
+# The loader templates out hostapd.conf, smb.conf, and other config files.
+
+# ── Capture Settings ──────────────────────────────────────────────────────────
+capture:
+  interval_minutes: 5
+  exposure_mode: auto         # auto | manual
+  shutter_speed: 10000        # microseconds (manual mode only)
+  iso: 100                    # ISO sensitivity (manual mode only)
+  luma_target: null           # auto-exposure luma target (null = camera default)
+
+# ── Playback Settings ────────────────────────────────────────────────────────
+playback:
+  fps: 25
+  display_brightness: 100     # 0–100 percent
+  display_type: hdmi          # hdmi | spi
+
+# ── WiFi Access Point (Pi 1) ─────────────────────────────────────────────────
+wifi:
+  ssid: timelapse-ap
+  password: changeme2
+  channel: 7
+
+# ── Uplink WiFi (optional internet bridge) ───────────────────────────────────
+uplink_wifi:
+  ssid: ""
+  password: ""
+
+# ── Admin Portal ─────────────────────────────────────────────────────────────
+admin:
+  password: changeme
+
+# ── Video Rendering ──────────────────────────────────────────────────────────
+rendering:
+  ffmpeg_video_backup_enabled: true
+
+# ── Samba Share Authentication ───────────────────────────────────────────────
+samba:
+  sync_password: timelapse   # password for timelapse-sync user (Pi2 → Pi1)

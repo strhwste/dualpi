@@ -51,7 +51,13 @@ git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR"
 
 cd "$REPO_DIR"
 BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-git pull --ff-only || error "git pull failed. Resolve any conflicts manually."
+
+# Atomic update: fetch then reset to remote, preserving any local stashes
+git fetch origin || error "git fetch failed. Check network connectivity."
+git stash --include-untracked 2>/dev/null || true
+git reset --hard origin/main || git reset --hard origin/HEAD || error "git reset failed."
+git stash drop 2>/dev/null || true
+
 AFTER=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
 if [[ "$BEFORE" == "$AFTER" ]]; then
@@ -79,10 +85,13 @@ cp "$SCRIPT_DIR/services/render.sh"       /opt/render.sh
 chmod +x /opt/render.sh
 
 # Systemd units
-cp "$SCRIPT_DIR/services/sync.service"       /etc/systemd/system/
-cp "$SCRIPT_DIR/services/playback.service"   /etc/systemd/system/
-cp "$SCRIPT_DIR/services/status_api.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/services/sync.service"             /etc/systemd/system/
+cp "$SCRIPT_DIR/services/playback.service"         /etc/systemd/system/
+cp "$SCRIPT_DIR/services/status_api.service"       /etc/systemd/system/
+cp "$SCRIPT_DIR/services/mnt-timelapse.mount"      /etc/systemd/system/
+cp "$SCRIPT_DIR/services/mnt-timelapse.automount"  /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable mnt-timelapse.automount 2>/dev/null || true
 
 ###############################################################################
 # 4. Restart services

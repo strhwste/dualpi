@@ -5,6 +5,7 @@ Wants=sync.service
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/mkdir -p /data/cache /data/renders
 ExecStart=/usr/bin/python3 /opt/playback.py
 WorkingDirectory=/data
 Restart=always

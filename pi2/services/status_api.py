@@ -10,6 +10,7 @@ No authentication (isolated local network).
 import json
 import glob
 import os
+import re
 import subprocess
 import time
 import threading
@@ -19,11 +20,33 @@ from datetime import datetime
 
 from flask import Flask, jsonify, request
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [status-api] %(levelname)s %(message)s",
-    stream=sys.stdout,
-)
+
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for journal integration."""
+
+    def format(self, record):
+        log_entry = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "level": record.levelname,
+            "service": "status-api",
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_entry)
+
+
+# Use JSON logging if LOG_FORMAT=json, otherwise use human-readable format
+if os.environ.get("LOG_FORMAT") == "json":
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JSONFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [status-api] %(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
 log = logging.getLogger("status-api")
 
 app = Flask(__name__)
@@ -132,6 +155,55 @@ def get_wifi_ssid() -> str:
         return result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def get_wifi_rssi() -> str:
+    """Return WiFi signal strength (RSSI) in dBm."""
+    try:
+        result = subprocess.run(
+            ["iwconfig", "wlan0"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            for part in result.stdout.split():
+                if part.startswith("level="):
+                    return part.split("=", 1)[1]
+            # Alternative format: "Signal level=-XX dBm"
+            m = re.search(r"Signal level[=:]?\s*(-?\d+)", result.stdout)
+            if m:
+                return m.group(1) + " dBm"
+    except Exception:
+        pass
+    return ""
+
+
+def ping_pi1() -> dict:
+    """Ping Pi 1 and return reachability + latency."""
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "3", "192.168.50.1"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            m = re.search(r"time=(\d+\.?\d*)", result.stdout)
+            latency = m.group(1) + " ms" if m else "ok"
+            return {"reachable": True, "latency": latency}
+    except Exception:
+        pass
+    return {"reachable": False, "latency": None}
+
+
+def get_mount_status() -> dict:
+    """Check the systemd mount unit status for /mnt/timelapse."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "mnt-timelapse.mount"],
+            capture_output=True, text=True, timeout=5,
+        )
+        active = result.stdout.strip()
+        mounted = active == "active"
+        return {"state": "mounted" if mounted else active, "mounted": mounted}
+    except Exception:
+        return {"state": "unknown", "mounted": False}
 
 
 def get_wifi_ip() -> str:
@@ -399,7 +471,7 @@ def sync_now():
 
 @app.route("/health")
 def health():
-    """Lightweight health-check endpoint for monitoring."""
+    """Lightweight health-check endpoint with WiFi, mount, and sync metrics."""
     checks = {}
     try:
         frame_current, frame_total = get_frame_info()
@@ -414,6 +486,27 @@ def health():
         checks["playback_state"] = get_playback_state()
     except Exception:
         checks["playback_state"] = "unknown"
+    try:
+        checks["wifi_rssi"] = get_wifi_rssi() or None
+    except Exception:
+        checks["wifi_rssi"] = None
+    try:
+        checks["pi1_ping"] = ping_pi1()
+    except Exception:
+        checks["pi1_ping"] = {"reachable": False, "latency": None}
+    try:
+        checks["mount"] = get_mount_status()
+    except Exception:
+        checks["mount"] = {"state": "unknown", "mounted": False}
+    try:
+        used, total = get_disk_usage()
+        checks["disk_used_gb"] = used
+        checks["disk_total_gb"] = total
+        checks["disk_percent"] = round(used / total * 100, 1) if total > 0 else 0
+    except Exception:
+        checks["disk_used_gb"] = None
+        checks["disk_total_gb"] = None
+        checks["disk_percent"] = None
     return jsonify({"status": "ok", **checks})
 
 

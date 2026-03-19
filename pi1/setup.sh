@@ -38,7 +38,7 @@ info "Updating apt and installing packages…"
 apt-get update -qq
 apt-get install -y \
   hostapd dnsmasq chrony fake-hwclock samba samba-common-bin samba-vfs-modules \
-  python3-flask python3-pillow python3-pip \
+  python3-flask python3-pillow python3-pip python3-yaml \
   rpicam-apps rsync exfatprogs iptables \
   ffmpeg jq
 
@@ -232,6 +232,12 @@ CONF
     info "Default config.json written."
 fi
 
+# Write default config.yaml (single source-of-truth) if absent
+if [[ ! -f /data/config.yaml ]]; then
+    cp "$SCRIPT_DIR/config.yaml" /data/config.yaml
+    info "Default config.yaml written."
+fi
+
 # Write initial session.id if absent
 if [[ ! -f /data/timelapse/current/session.id ]]; then
     date +"%Y%m%d_%H%M%S" > /data/timelapse/current/session.id
@@ -245,8 +251,11 @@ chown -R 1000:1000 /data /backup 2>/dev/null || true
 ###############################################################################
 info "Configuring WiFi Access Point…"
 
-# Read SSID / password from config.json if available
-if [[ -f /data/config.json ]]; then
+# Read SSID / password from config.yaml (preferred) or config.json (legacy)
+if [[ -f /data/config.yaml ]]; then
+    WIFI_SSID=$(python3 -c "import yaml; c=yaml.safe_load(open('/data/config.yaml')); print(c.get('wifi',{}).get('ssid','timelapse-ap'))" 2>/dev/null || echo "timelapse-ap")
+    WIFI_PASS=$(python3 -c "import yaml; c=yaml.safe_load(open('/data/config.yaml')); print(c.get('wifi',{}).get('password','changeme2'))" 2>/dev/null || echo "changeme2")
+elif [[ -f /data/config.json ]]; then
     WIFI_SSID=$(jq -r '.wifi_ssid // "timelapse-ap"' /data/config.json)
     WIFI_PASS=$(jq -r '.wifi_password // "changeme2"' /data/config.json)
 else
@@ -329,15 +338,65 @@ systemctl enable chrony
 ###############################################################################
 info "Configuring Samba…"
 cp "$SCRIPT_DIR/smb.conf" /etc/samba/smb.conf
+
+# Create a dedicated low-privilege Samba user for Pi 2 sync access
+if ! id timelapse-sync &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin timelapse-sync
+fi
+# Read Samba sync password from config.yaml if available, else use default
+SAMBA_SYNC_PASS="timelapse"
+if [[ -f /data/config.yaml ]] && command -v python3 &>/dev/null; then
+    SAMBA_SYNC_PASS=$(python3 -c "
+import yaml, sys
+try:
+    c = yaml.safe_load(open('/data/config.yaml'))
+    print(c.get('samba', {}).get('sync_password', 'timelapse'))
+except Exception:
+    print('timelapse')
+" 2>/dev/null || echo "timelapse")
+fi
+# Set Samba password for timelapse-sync (non-interactive)
+printf '%s\n%s\n' "$SAMBA_SYNC_PASS" "$SAMBA_SYNC_PASS" | smbpasswd -s -a timelapse-sync
+smbpasswd -e timelapse-sync
+
 systemctl enable smbd nmbd
+
+###############################################################################
+# 6b. Avahi mDNS on Pi 1 (allows Pi 2 to resolve pi1-camera.local)
+###############################################################################
+info "Configuring Avahi mDNS (hostname: pi1-camera.local)…"
+apt-get install -y avahi-daemon 2>/dev/null || true
+hostnamectl set-hostname pi1-camera 2>/dev/null || true
+cat > /etc/avahi/avahi-daemon.conf <<'EOF'
+[server]
+host-name=pi1-camera
+domain-name=local
+use-ipv4=yes
+use-ipv6=no
+allow-interfaces=wlan0
+
+[publish]
+publish-addresses=yes
+publish-hinfo=no
+publish-workstation=no
+
+[wide-area]
+enable-wide-area=no
+
+[reflector]
+enable-reflector=no
+EOF
+systemctl enable avahi-daemon
+systemctl restart avahi-daemon 2>/dev/null || true
 
 ###############################################################################
 # 7. Install Python services
 ###############################################################################
 info "Installing Python services…"
 
-cp "$SCRIPT_DIR/services/capture.py"  /opt/capture.py
-cp "$SCRIPT_DIR/services/portal.py"   /opt/portal.py
+cp "$SCRIPT_DIR/services/capture.py"       /opt/capture.py
+cp "$SCRIPT_DIR/services/portal.py"        /opt/portal.py
+cp "$SCRIPT_DIR/services/config_loader.py" /opt/config_loader.py
 
 # Copy templates directory
 mkdir -p /opt/templates
@@ -345,7 +404,10 @@ if [[ -d "$SCRIPT_DIR/services/templates" ]]; then
     cp -r "$SCRIPT_DIR/services/templates/"* /opt/templates/ 2>/dev/null || true
 fi
 
-chmod +x /opt/capture.py /opt/portal.py
+chmod +x /opt/capture.py /opt/portal.py /opt/config_loader.py
+
+# Apply config.yaml → generate config.json and template conf files
+python3 /opt/config_loader.py 2>/dev/null || warn "Config loader failed — using existing config files."
 
 ###############################################################################
 # 8. Install systemd units
